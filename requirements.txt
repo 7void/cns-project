@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+cryptography
+psycopg2-binary
+redis
+pydantic
+python-multipart
+minio
