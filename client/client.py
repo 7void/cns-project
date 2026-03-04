@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import secrets
 import uuid
 import urllib.error
@@ -11,6 +12,8 @@ from typing import Any, Optional
 
 from crypto import aes, kdf, shamir
 from crypto.utils import best_effort_wipe, random_bytes
+
+from storage.minio_adapter import StorageError, download_object
 
 
 class AuthorityRefusal(Exception):
@@ -87,6 +90,11 @@ class TrustedClient:
 		self._config = config
 		self.client_id = client_id or str(uuid.uuid4())
 		self._client_share: Optional[bytes] = None
+
+	def set_client_share(self, *, client_share: bytes) -> None:
+		if not isinstance(client_share, (bytes, bytearray)) or len(client_share) == 0:
+			raise ValueError("client_share must be non-empty bytes")
+		self._client_share = bytes(client_share)
 
 	def provision_key_material(self, *, key_id: str, expires_in_seconds: int) -> None:
 		"""Generate an AES key, split it (t=2,n=3), retain one share, register one with authority."""
@@ -207,22 +215,44 @@ class TrustedClient:
 			best_effort_wipe(derived_key_buf)
 
 
-def _demo() -> None:
-	"""Minimal manual demo.
+def create_demo_session(*, config: ClientConfig) -> dict[str, str]:
+	"""Request the authority to create a demo session.
 
-	Start the authority first:
-	  uvicorn authority.main:app --reload
+	Returns a dict with: key_id, object_id, client_id, client_share.
 	"""
-	client = TrustedClient(config=ClientConfig(authority_base_url="http://127.0.0.1:8000"))
-	key_id = "example-key"
-	client.provision_key_material(key_id=key_id, expires_in_seconds=300)
+	url = f"{config.authority_base_url.rstrip('/')}/create_demo_session"
+	body = _post_json(url=url, payload={}, timeout_seconds=config.timeout_seconds)
+	key_id = str(body.get("key_id") or "")
+	object_id = str(body.get("object_id") or "")
+	client_id = str(body.get("client_id") or "")
+	client_share = str(body.get("client_share") or "")
+	if not (key_id and object_id and client_id and client_share):
+		raise AuthorityTransportError(f"create_demo_session returned incomplete response: {body}")
+	return {"key_id": key_id, "object_id": object_id, "client_id": client_id, "client_share": client_share}
+
+
+def _demo() -> None:
+	"""End-to-end demo with zero manual copy/paste.
+
+	Requirements:
+	- Authority running (e.g. `uvicorn authority.main:app --reload`)
+	- MinIO env vars set (MINIO_ACCESS_KEY/MINIO_SECRET_KEY, etc.)
+	"""
+	config = ClientConfig(authority_base_url=os.getenv("AUTHORITY_BASE_URL", "http://10.204.224.110:8000"))
+	session = create_demo_session(config=config)
+
+	client = TrustedClient(config=config, client_id=session["client_id"])
+	client.set_client_share(client_share=_b64decode(session["client_share"]))
 
 	try:
-		env = client.encrypt_for_storage(key_id=key_id, plaintext=b"secret data")
-		pt = client.decrypt_from_storage(envelope=env)
-		print(pt.decode("utf-8"))
-	except AuthorityRefusal as exc:
-		print(f"Access refused: {exc}")
+		blob = download_object(session["object_id"])
+		envelope = json.loads(blob.decode("utf-8"))
+		if not isinstance(envelope, dict):
+			raise ValueError("storage object is not a JSON dict")
+		pt = client.decrypt_from_storage(envelope=envelope)
+		print(pt.decode("utf-8", errors="replace"))
+	except (AuthorityRefusal, AuthorityTransportError, StorageError, ValueError, json.JSONDecodeError) as exc:
+		print(f"Demo failed: {exc}")
 
 
 if __name__ == "__main__":

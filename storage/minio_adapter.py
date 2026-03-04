@@ -48,7 +48,7 @@ def _get_client() -> tuple[Minio, str]:
 		return _client, _bucket
 
 	cfg = MinioConfig(
-		endpoint=_env("MINIO_ENDPOINT", "localhost:9000"),
+		endpoint=_env("MINIO_ENDPOINT", "127.0.0.1:9000"),
 		access_key=_env("MINIO_ACCESS_KEY"),
 		secret_key=_env("MINIO_SECRET_KEY"),
 		bucket=_env("MINIO_BUCKET", "cns-project"),

@@ -6,6 +6,7 @@ import logging
 import secrets
 import threading
 import time
+import os
 import urllib.error
 import urllib.request
 import uuid
@@ -82,13 +83,14 @@ def _context_for_kdf(*, client_id: str, nonce: bytes) -> bytes:
 
 @dataclass(frozen=True)
 class DemoConfig:
-	authority_base_url: str = "http://127.0.0.1:8000"
+	authority_base_url: str = os.getenv("AUTHORITY_BASE_URL", "http://10.129.47.110:8000")
 	http_timeout_seconds: float = 5.0
-	expires_in_seconds: int = 60
+	# Keep the authority share alive long enough for a live multi-laptop demo.
+	expires_in_seconds: int = 24 * 60 * 60
 
 
 class AuthorityServer:
-	def __init__(self, host: str = "127.0.0.1", port: int = 8000) -> None:
+	def __init__(self, host: str = "0.0.0.0", port: int = 8000) -> None:
 		self._host = host
 		self._port = port
 		self._server: Optional[uvicorn.Server] = None
@@ -186,8 +188,10 @@ def run_demo() -> None:
 	cfg = DemoConfig()
 	server = AuthorityServer()
 
-	log.info("Starting authority service")
-	server.start()
+	start_local_authority = os.getenv("DEMO_START_LOCAL_AUTHORITY", "0").strip().lower() in {"1", "true", "yes", "y", "on"}
+	if start_local_authority:
+		log.info("Starting authority service (binding to 0.0.0.0 for LAN access)")
+		server.start()
 	try:
 		_wait_for_authority(cfg)
 
@@ -195,13 +199,16 @@ def run_demo() -> None:
 		object_id = f"demo-object-{uuid.uuid4()}"
 		client_id = f"client-{uuid.uuid4()}"
 
-		plaintext = b"Confidential: project-grade irreversible revocation demo"
+		# One-time setup
+		plaintext = b"Confidential: live demo object (encrypted client-side)"
 		log.info("Generated plaintext (len=%d)", len(plaintext))
 
 		master_key = aes.generate_key()
 		master_key_buf = bytearray(master_key)
 		log.info("Generated AES-256 master key (not logged)")
 
+		client_share: bytes
+		authority_share: bytes
 		try:
 			shares = shamir.split(master_key, t=2, n=3)
 			client_share = shares[0]
@@ -211,26 +218,17 @@ def run_demo() -> None:
 			log.info("Split master key with Shamir (t=2, n=3)")
 
 			_authority_register_share(cfg=cfg, key_id=key_id, client_id=client_id, authority_share=authority_share)
-			log.info("Stored one share in authority")
-			log.info("Stored one share in client (in-memory)")
-
+			log.info("Registered authority share")
 		finally:
 			best_effort_wipe(master_key_buf)
 
-		# Encrypt & upload
-		req_nonce_1 = secrets.token_urlsafe(32)
-		resp1 = _authority_request_share(cfg=cfg, key_id=key_id, client_id=client_id, nonce=req_nonce_1)
-		if resp1.get("status") != "ok":
-			raise AuthorityRefusal(f"request denied unexpectedly: {resp1}")
-		if resp1.get("key_status") != "ACTIVE":
-			raise RuntimeError(f"expected ACTIVE key_status, got: {resp1.get('key_status')}")
-		authority_share_1 = _b64d(resp1["authority_share_b64"])
-		master_key_1 = shamir.combine([client_share, authority_share_1])
-		master_key_1_buf = bytearray(master_key_1)
+		# Encrypt & upload (no authority requests; just local reconstruction for setup)
+		reconstructed_master = shamir.combine([client_share, authority_share])
+		reconstructed_master_buf = bytearray(reconstructed_master)
 		derived_key_buf: Optional[bytearray] = None
 		try:
 			kdf_nonce = random_bytes(16)
-			derived_key = kdf.derive(master_key_1, context=_context_for_kdf(client_id=client_id, nonce=kdf_nonce))
+			derived_key = kdf.derive(reconstructed_master, context=_context_for_kdf(client_id=client_id, nonce=kdf_nonce))
 			derived_key_buf = bytearray(derived_key)
 
 			enc = aes.encrypt(plaintext, key=derived_key)
@@ -244,94 +242,34 @@ def run_demo() -> None:
 			upload_object(object_id, blob)
 			log.info("Uploaded encrypted blob to untrusted storage (object_id=%s, bytes=%d)", object_id, len(blob))
 		finally:
-			best_effort_wipe(master_key_1_buf)
+			best_effort_wipe(reconstructed_master_buf)
 			best_effort_wipe(derived_key_buf)
 
-		# Happy-path decrypt
-		blob2 = download_object(object_id)
-		log.info("Downloaded encrypted blob from storage (bytes=%d)", len(blob2))
-		env2 = json.loads(blob2.decode("utf-8"))
-		req_nonce_2 = secrets.token_urlsafe(32)
-		resp2 = _authority_request_share(cfg=cfg, key_id=key_id, client_id=client_id, nonce=req_nonce_2)
-		if resp2.get("status") != "ok":
-			raise AuthorityRefusal(f"request denied unexpectedly: {resp2}")
-		if resp2.get("key_status") != "ACTIVE":
-			raise RuntimeError(f"expected ACTIVE key_status, got: {resp2.get('key_status')}")
-		authority_share_2 = _b64d(resp2["authority_share_b64"])
-		master_key_2 = shamir.combine([client_share, authority_share_2])
-		master_key_2_buf = bytearray(master_key_2)
-		derived_key_2_buf: Optional[bytearray] = None
-		try:
-			kdf_nonce2 = _b64d(env2["kdf_nonce_b64"])
-			derived_key2 = kdf.derive(master_key_2, context=_context_for_kdf(client_id=client_id, nonce=kdf_nonce2))
-			derived_key_2_buf = bytearray(derived_key2)
-			pt2 = aes.decrypt(env2["aes"], key=derived_key2)
-			if pt2 != plaintext:
-				raise RuntimeError("decryption produced unexpected plaintext")
-			log.info("Access allowed: decryption succeeded (plaintext not logged)")
-		finally:
-			best_effort_wipe(master_key_2_buf)
-			best_effort_wipe(derived_key_2_buf)
+		# Output required values for the live multi-laptop demo.
+		client_share_b64 = _b64e(client_share)
+		print("\n=== LIVE DEMO SETUP OUTPUT ===")
+		print("KEY_ID        =", key_id)
+		print("OBJECT_ID     =", object_id)
+		print("CLIENT_ID     =", client_id)
+		print("CLIENT_SHARE  =", client_share_b64)
+		print("==============================\n")
+		print("Setup complete. Authority is running and will stay alive for the live demo.")
+		print("Authority binds to 0.0.0.0:8000 (LAN-accessible).")
+		print("Press Ctrl+C to stop this script when you're done.\n")
 
-		# Trigger revocation via attack detection: replay the same nonce
-		replay_nonce = secrets.token_urlsafe(32)
-		log.info("Triggering revocation via nonce replay (attack detector)")
-		ok_before = _authority_request_share(cfg=cfg, key_id=key_id, client_id=client_id, nonce=replay_nonce)
-		if ok_before.get("status") != "ok":
-			raise RuntimeError(f"expected ok before replay, got: {ok_before}")
-		denied_after = _authority_request_share(cfg=cfg, key_id=key_id, client_id=client_id, nonce=replay_nonce)
-		if denied_after.get("status") != "denied":
-			raise RuntimeError(f"expected denied after replay, got: {denied_after}")
-		if denied_after.get("denial_reason") != "revoked":
-			raise RuntimeError(f"expected denial_reason=revoked, got: {denied_after.get('denial_reason')}")
-		if denied_after.get("key_status") != "DESTROYED":
-			raise RuntimeError(f"expected key_status=DESTROYED, got: {denied_after.get('key_status')}")
-		log.info("Key destruction observed: key_status=%s", denied_after.get("key_status"))
+		# Long-running mode: do NOT trigger attacks, revocation, teardown, or shutdown.
+		while True:
+			time.sleep(3600)
 
-		# Assert revocation happens exactly once: destroy_key must now be idempotent.
-		destroy_resp = _authority_destroy_key(
-			cfg=cfg,
-			key_id=key_id,
-			client_id=client_id,
-			nonce=secrets.token_urlsafe(32),
-			reason="demo_assert_idempotent",
-		)
-		if destroy_resp.get("key_status") != "DESTROYED":
-			raise RuntimeError(f"expected DESTROYED after revocation, got: {destroy_resp}")
-		if destroy_resp.get("destroyed") is not False:
-			raise RuntimeError(f"expected destroyed=false (already revoked), got: {destroy_resp}")
-
-		# Attempt decryption again; must fail permanently.
-		log.info("Attempting decryption after revocation (must fail irreversibly)")
-		failures = 0
-		for attempt in range(1, 4):
-			resp = _authority_request_share(cfg=cfg, key_id=key_id, client_id=client_id, nonce=secrets.token_urlsafe(32))
-			if resp.get("status") != "denied":
-				raise RuntimeError(f"unexpectedly obtained authority share after revocation: {resp}")
-			if resp.get("denial_reason") != "revoked" or resp.get("key_status") != "DESTROYED":
-				raise RuntimeError(f"unexpected denial structure after revocation: {resp}")
-			failures += 1
-			log.info(
-				"Decryption blocked (attempt=%d): denial_reason=%s key_status=%s",
-				attempt,
-				resp.get("denial_reason"),
-				resp.get("key_status"),
-			)
-
-		if failures != 3:
-			raise RuntimeError("revocation was not permanent")
-
-		log.info("Permanent failure proven: no retries can recover the share")
-
-		try:
-			delete_object(object_id)
-			log.info("Deleted encrypted blob from storage")
-		except StorageError:
-			pass
-
-	finally:
-		log.info("Stopping authority service")
+	except KeyboardInterrupt:
+		log.info("Received Ctrl+C; stopping authority service")
+		if start_local_authority:
+			server.stop()
+		return
+	except Exception:
+		log.exception("Setup failed; stopping authority service")
 		server.stop()
+		raise
 
 
 if __name__ == "__main__":
