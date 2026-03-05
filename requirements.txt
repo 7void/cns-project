@@ -6,3 +6,6 @@ redis
 pydantic
 python-multipart
 minio
+pycryptodome
+streamlit
+requests

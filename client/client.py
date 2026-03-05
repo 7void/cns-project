@@ -3,17 +3,25 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import secrets
+import threading
 import uuid
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
 
+# Allow running as a script (e.g., `python client/client.py`) by ensuring the
+# project root is on sys.path so top-level modules like `crypto` can be imported.
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+	sys.path.insert(0, PROJECT_ROOT)
+
 from crypto import aes, kdf, shamir
 from crypto.utils import best_effort_wipe, random_bytes
 
-from storage.minio_adapter import StorageError, download_object
+from storage.minio_adapter import StorageError, download_object, upload_object
 
 
 class AuthorityRefusal(Exception):
@@ -215,42 +223,102 @@ class TrustedClient:
 			best_effort_wipe(derived_key_buf)
 
 
-def create_demo_session(*, config: ClientConfig) -> dict[str, str]:
-	"""Request the authority to create a demo session.
 
-	Returns a dict with: key_id, object_id, client_id, client_share.
+def _get_json(*, url: str, timeout_seconds: float) -> dict[str, Any]:
+	req = urllib.request.Request(url=url, method="GET")
+	try:
+		with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+			body = resp.read()
+			decoded = json.loads(body.decode("utf-8"))
+			if not isinstance(decoded, dict):
+				raise AuthorityTransportError("authority returned unexpected JSON")
+			return decoded
+	except urllib.error.URLError as exc:
+		raise AuthorityTransportError(f"authority unreachable: {exc.reason}") from exc
+	except Exception as exc:  # noqa: BLE001
+		raise AuthorityTransportError("authority health check failed") from exc
+
+
+def _wait_for_authority(*, config: ClientConfig, attempts: int = 30, delay_s: float = 0.2) -> None:
+	url = f"{config.authority_base_url.rstrip('/')}/healthz"
+	for _ in range(attempts):
+		try:
+			body = _get_json(url=url, timeout_seconds=min(1.0, config.timeout_seconds))
+			if body.get("status") == "ok":
+				return
+		except AuthorityTransportError:
+			import time
+
+			time.sleep(delay_s)
+	raise AuthorityTransportError(
+		"authority did not become ready. Start it with: uvicorn authority.main:app --host 127.0.0.1 --port 8000"
+	)
+
+
+def _start_authority_in_background(*, host: str = "127.0.0.1", port: int = 8000) -> None:
+	"""Best-effort helper for local demos.
+
+	Starts the FastAPI authority using uvicorn in a daemon thread.
 	"""
-	url = f"{config.authority_base_url.rstrip('/')}/create_demo_session"
-	body = _post_json(url=url, payload={}, timeout_seconds=config.timeout_seconds)
-	key_id = str(body.get("key_id") or "")
-	object_id = str(body.get("object_id") or "")
-	client_id = str(body.get("client_id") or "")
-	client_share = str(body.get("client_share") or "")
-	if not (key_id and object_id and client_id and client_share):
-		raise AuthorityTransportError(f"create_demo_session returned incomplete response: {body}")
-	return {"key_id": key_id, "object_id": object_id, "client_id": client_id, "client_share": client_share}
+	try:
+		import uvicorn
+	except Exception:  # noqa: BLE001
+		return
+
+	config = uvicorn.Config(
+		"authority.main:app",
+		host=host,
+		port=port,
+		log_level="error",
+		access_log=False,
+	)
+	server = uvicorn.Server(config)
+
+	def _run() -> None:
+		server.run()
+
+	threading.Thread(target=_run, name="authority-server", daemon=True).start()
 
 
 def _demo() -> None:
-	"""End-to-end demo with zero manual copy/paste.
+	"""End-to-end demo (client provisions, storage holds ciphertext, authority can revoke).
 
 	Requirements:
-	- Authority running (e.g. `uvicorn authority.main:app --reload`)
+	- Authority running (start with: `uvicorn authority.main:app --host 127.0.0.1 --port 8000`)
 	- MinIO env vars set (MINIO_ACCESS_KEY/MINIO_SECRET_KEY, etc.)
 	"""
-	config = ClientConfig(authority_base_url=os.getenv("AUTHORITY_BASE_URL", "http://10.204.224.110:8000"))
-	session = create_demo_session(config=config)
-
-	client = TrustedClient(config=config, client_id=session["client_id"])
-	client.set_client_share(client_share=_b64decode(session["client_share"]))
-
+	config = ClientConfig(authority_base_url=os.getenv("AUTHORITY_BASE_URL", "http://127.0.0.1:8000"))
 	try:
-		blob = download_object(session["object_id"])
-		envelope = json.loads(blob.decode("utf-8"))
-		if not isinstance(envelope, dict):
+		try:
+			_wait_for_authority(config=config)
+		except AuthorityTransportError:
+			# Local convenience: auto-start authority if not running.
+			_start_authority_in_background(host="127.0.0.1", port=8000)
+			_wait_for_authority(config=config)
+		key_id = f"demo-key-{uuid.uuid4()}"
+		object_id = f"demo-object-{uuid.uuid4()}"
+
+		client = TrustedClient(config=config)
+		client.provision_key_material(key_id=key_id, expires_in_seconds=300)
+
+		envelope = client.encrypt_for_storage(key_id=key_id, plaintext=b"Confidential demo payload")
+		try:
+			upload_object(object_id, json.dumps(envelope).encode("utf-8"))
+		except StorageError as exc:
+			minio_endpoint = os.getenv("MINIO_ENDPOINT")
+			raise StorageError(
+				f"{exc}. MINIO_ENDPOINT is currently set to: {minio_endpoint!r}. "
+				"For local MinIO: run `docker compose up -d` then set MINIO_ENDPOINT=localhost:9000, "
+				"MINIO_ACCESS_KEY=minioadmin, MINIO_SECRET_KEY=minioadmin."
+			) from exc
+
+		blob = download_object(object_id)
+		loaded = json.loads(blob.decode("utf-8"))
+		if not isinstance(loaded, dict):
 			raise ValueError("storage object is not a JSON dict")
-		pt = client.decrypt_from_storage(envelope=envelope)
+		pt = client.decrypt_from_storage(envelope=loaded)
 		print(pt.decode("utf-8", errors="replace"))
+		print(f"OK: key_id={key_id} object_id={object_id} client_id={client.client_id}")
 	except (AuthorityRefusal, AuthorityTransportError, StorageError, ValueError, json.JSONDecodeError) as exc:
 		print(f"Demo failed: {exc}")
 

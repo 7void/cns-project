@@ -1,0 +1,18 @@
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: cns-minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      # MinIO's own credentials (for the server)
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+volumes:
+  minio-data:
