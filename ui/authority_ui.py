@@ -4,7 +4,7 @@ import uuid
 
 st.set_page_config(page_title="Key Authority", layout="centered")
 
-AUTHORITY_URL = "http://10.173.174.110:8000"
+AUTHORITY_URL = "http://127.0.0.1:8000"
 
 st.title("🔐 Key Authority Console")
 
