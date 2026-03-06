@@ -1,6 +1,7 @@
 import os
 import sys
 import traceback
+import uuid
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -8,131 +9,316 @@ if PROJECT_ROOT not in sys.path:
 
 import streamlit as st
 import requests
-import uuid
 import base64
 import json
+from typing import Any
 
 from crypto import aes, kdf, shamir
-from storage.minio_adapter import download_object
+from crypto.utils import best_effort_wipe, random_bytes
+from storage.minio_adapter import StorageError, download_object, upload_object
 
-# ================= CONFIG =================
 DEFAULT_AUTHORITY_URL = os.getenv("AUTHORITY_BASE_URL", "http://127.0.0.1:8000")
 
-# Optional defaults (if you want the UI to boot with an existing session).
-DEFAULT_KEY_ID = ""
-DEFAULT_OBJECT_ID = ""
-DEFAULT_CLIENT_ID = ""
-DEFAULT_CLIENT_SHARE_B64 = ""
-# ==========================================
 
-st.set_page_config(page_title="Client / Hacker", layout="centered")
-st.title("🧑‍💻 Client / Hacker Console")
+def _b64e(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _b64d(data_b64: str) -> bytes:
+    return base64.b64decode(data_b64, validate=True)
+
+
+def _device_key_path(client_id: str) -> str:
+    return os.path.join(PROJECT_ROOT, "client", "device_keys", f"{client_id}.json")
+
+
+def _load_local_client_share(client_id: str) -> bytes | None:
+    path = _device_key_path(client_id)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        share_b64 = str(data.get("client_share_b64") or "")
+        return _b64d(share_b64) if share_b64 else None
+    except Exception:
+        return None
+
+
+def _save_local_client_share(client_id: str, client_share: bytes) -> None:
+    os.makedirs(os.path.dirname(_device_key_path(client_id)), exist_ok=True)
+    with open(_device_key_path(client_id), "w", encoding="utf-8") as f:
+        json.dump({"client_id": client_id, "client_share_b64": _b64e(client_share)}, f)
+
+
+def _post_json(url: str, payload: dict[str, Any], timeout_s: float = 10.0) -> dict[str, Any]:
+    resp = requests.post(url, json=payload, timeout=timeout_s)
+    try:
+        return resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Non-JSON response from authority: HTTP {resp.status_code}") from exc
+
+
+def _get_json(url: str, timeout_s: float = 10.0) -> dict[str, Any]:
+    resp = requests.get(url, timeout=timeout_s)
+    try:
+        return resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Non-JSON response from authority: HTTP {resp.status_code}") from exc
+
+st.set_page_config(page_title="Client Vault", layout="centered")
+st.title("🧑‍💻 Client Vault")
 
 if "authority_url" not in st.session_state:
     st.session_state["authority_url"] = DEFAULT_AUTHORITY_URL
-if "key_id" not in st.session_state:
-    st.session_state["key_id"] = DEFAULT_KEY_ID
-if "object_id" not in st.session_state:
-    st.session_state["object_id"] = DEFAULT_OBJECT_ID
 if "client_id" not in st.session_state:
-    st.session_state["client_id"] = DEFAULT_CLIENT_ID
-if "client_share_b64" not in st.session_state:
-    st.session_state["client_share_b64"] = DEFAULT_CLIENT_SHARE_B64
+    st.session_state["client_id"] = ""
+if "client_name" not in st.session_state:
+    st.session_state["client_name"] = ""
 if "client_share" not in st.session_state:
-    st.session_state["client_share"] = base64.b64decode(st.session_state["client_share_b64"]) if st.session_state["client_share_b64"] else None
+    st.session_state["client_share"] = None
+if "files" not in st.session_state:
+    st.session_state["files"] = []
+if "all_clients" not in st.session_state:
+	st.session_state["all_clients"] = []
 
 authority_url = st.text_input("Authority URL", value=st.session_state["authority_url"])
 st.session_state["authority_url"] = authority_url
+authority_base = authority_url.rstrip("/")
 
-col1, col2 = st.columns(2)
-with col1:
-    if st.button("🆕 CREATE DEMO SESSION"):
-        try:
-            authority_url = st.session_state["authority_url"].rstrip("/")
-            resp = requests.post(
-                f"{authority_url}/create_demo_session",
-                json={},
-                timeout=10,
-            ).json()
-            missing = [k for k in ("key_id", "object_id", "client_id", "client_share") if not resp.get(k)]
-            if missing:
-                raise RuntimeError(f"Missing fields from /create_demo_session: {missing} ({resp})")
+if not st.session_state.get("client_id"):
+	st.header("Login")
+	col1, col2 = st.columns(2)
+	with col1:
+		name = st.text_input("Username", placeholder="e.g. Alice")
+		password = st.text_input("Password", type="password", placeholder="your password")
+		if st.button("🔐 Login"):
+			try:
+				resp = _post_json(f"{authority_base}/login", {"name": name, "password": password})
+				client_id = str(resp.get("client_id") or "")
+				client_name = str(resp.get("name") or "")
+				if not client_id:
+					raise RuntimeError(f"login failed: {resp}")
+				st.session_state["client_id"] = client_id
+				st.session_state["client_name"] = client_name
+				share = _load_local_client_share(client_id)
+				if share:
+					st.session_state["client_share"] = share
+				st.success(f"Logged in as {client_name}")
+				st.rerun()
+			except Exception:
+				st.error("Login failed (invalid name or password)")
+	with col2:
+		st.subheader("New user?")
+		new_name = st.text_input("Username", placeholder="e.g. Bob", key="reg_name")
+		new_password = st.text_input("Password", type="password", placeholder="your password", key="reg_pass")
+		if st.button("✅ Register"):
+			try:
+				resp = _post_json(f"{authority_base}/register_client", {"name": new_name, "password": new_password})
+				client_id = str(resp.get("client_id") or "")
+				if not client_id:
+					raise RuntimeError(f"register failed: {resp}")
+				st.session_state["client_id"] = client_id
+				st.session_state["client_name"] = new_name
+				st.success(f"Registered as {new_name}. Logging in...")
+				st.rerun()
+			except Exception:
+				st.error("Registration failed")
+				st.code(traceback.format_exc())
+	st.stop()
 
-            st.session_state["key_id"] = str(resp["key_id"])
-            st.session_state["object_id"] = str(resp["object_id"])
-            st.session_state["client_id"] = str(resp["client_id"])
-            st.session_state["client_share_b64"] = str(resp["client_share"])
-            st.session_state["client_share"] = base64.b64decode(st.session_state["client_share_b64"])
-            st.success("Demo session created")
-        except Exception:
-            st.error("Failed to create demo session")
-            st.code(traceback.format_exc())
-with col2:
-    st.caption("Use this if the key expired or was destroyed")
+st.header(f"Welcome, {st.session_state['client_name']}")
+if st.button("🚪 Logout"):
+	st.session_state["client_id"] = ""
+	st.session_state["client_name"] = ""
+	st.session_state["client_share"] = None
+	st.success("Logged out")
+	st.rerun()
 
-st.write(
-    "Current session:",
-    {
-        "key_id": st.session_state["key_id"],
-        "object_id": st.session_state["object_id"],
-        "client_id": st.session_state["client_id"],
-    },
+st.header("Client Share")
+import_share_b64 = st.text_input("Import share (base64)", value="", placeholder="Paste client share b64 from collaborator")
+if st.button("💾 Save Imported Share"):
+	try:
+		share = _b64d(import_share_b64.strip())
+		st.session_state["client_share"] = share
+		_save_local_client_share(st.session_state["client_id"], share)
+		st.success("Saved client share locally")
+	except Exception:
+		st.error("Failed to save imported share")
+		st.code(traceback.format_exc())
+
+st.header("Upload File")
+if st.button("🔄 Refresh Available Clients"):
+	try:
+		all_clients = _get_json(f"{authority_base}/clients")
+		if not isinstance(all_clients, list):
+			raise RuntimeError("/clients returned unexpected response")
+		st.session_state["all_clients"] = all_clients
+		st.success(f"Loaded {len(all_clients)} registered clients")
+	except Exception:
+		st.error("Failed to refresh clients")
+		st.code(traceback.format_exc())
+
+uploaded = st.file_uploader("Choose a file", type=None)
+
+st.subheader("Grant Access To")
+all_clients = st.session_state.get("all_clients") or []
+other_clients = [c for c in all_clients if c["client_id"] != st.session_state["client_id"]]
+selected_clients = st.multiselect(
+	"Select which clients can decrypt this file",
+	options=other_clients,
+	format_func=lambda c: f"{c['name']} ({c['client_id']})",
 )
 
-if st.button("📂 ACCESS CONFIDENTIAL FILE"):
-    try:
-        if not st.session_state.get("key_id") or not st.session_state.get("object_id") or not st.session_state.get("client_id"):
-            st.error("No active demo session. Click 'CREATE DEMO SESSION' first.")
-            st.stop()
-        if st.session_state.get("client_share") is None:
-            st.error("Missing client share. Click 'CREATE DEMO SESSION' first.")
-            st.stop()
+if st.button("⬆️ Encrypt + Upload + Register"):
+	try:
+		if uploaded is None:
+			raise RuntimeError("Choose a file first")
+		uploader_id = (st.session_state.get("client_id") or "").strip()
+		if not uploader_id:
+			raise RuntimeError("Not logged in")
+		authorized_clients = [c["client_id"] for c in selected_clients]
+		if not authorized_clients:
+			raise RuntimeError("Select at least one authorized client")
 
-        st.write("STEP 1: Requesting authority share")
+		plaintext = uploaded.getvalue()
+		filename = uploaded.name or "uploaded.bin"
 
-        nonce = str(uuid.uuid4())
-        authority_url = st.session_state["authority_url"].rstrip("/")
-        resp = requests.post(
-            f"{authority_url}/request_share",
-            json={
-                "key_id": st.session_state["key_id"],
-                "client_id": st.session_state["client_id"],
-                "nonce": nonce
-            },
-            timeout=5
-        ).json()
+		master_key = aes.generate_key()
+		master_key_buf = bytearray(master_key)
+		derived_key_buf: bytearray | None = None
+		try:
+			shares = shamir.split(master_key, t=2, n=3)
+			client_share = shares[0]
+			authority_share = shares[1]
+			best_effort_wipe(bytearray(shares[2]))
 
-        st.write("Authority response:", resp)
+			_save_local_client_share(uploader_id, client_share)
+			st.session_state["client_share"] = client_share
 
-        if resp.get("status") != "ok":
-            st.error(f"❌ ACCESS DENIED — key_status={resp.get('key_status')}")
-            st.stop()
+			key_id = f"key-{uuid.uuid4()}"
+			object_id = f"object-{uuid.uuid4()}"
+			kdf_nonce = random_bytes(16)
+			derived_key = kdf.derive(master_key, context=uploader_id.encode("utf-8") + b"|" + kdf_nonce)
+			derived_key_buf = bytearray(derived_key)
 
-        st.write("STEP 2: Reconstructing master key")
+			aes_payload = aes.encrypt(plaintext, key=derived_key)
+			envelope = {
+				"key_id": key_id,
+				"client_id": uploader_id,
+				"kdf_nonce_b64": _b64e(kdf_nonce),
+				"aes": aes_payload,
+				"filename": filename,
+			}
+			blob = json.dumps(envelope).encode("utf-8")
+			upload_object(object_id, blob)
+		finally:
+			best_effort_wipe(master_key_buf)
+			best_effort_wipe(derived_key_buf)
 
-        authority_share = base64.b64decode(resp["authority_share_b64"])
-        client_share = st.session_state["client_share"]
-        master_key = shamir.combine([client_share, authority_share])
+		resp = _post_json(
+			f"{authority_base}/register_file",
+			{
+				"filename": filename,
+				"uploader_id": uploader_id,
+				"authorized_clients": authorized_clients,
+				"key_id": key_id,
+				"object_id": object_id,
+				"authority_share_b64": _b64e(authority_share),
+			},
+		)
+		file_id = str(resp.get("file_id") or "")
+		if not file_id:
+			raise RuntimeError(f"register_file failed: {resp}")
 
-        st.write("STEP 3: About to download object from MinIO")
-        st.write("MINIO_ENDPOINT =", os.getenv("MINIO_ENDPOINT"))
+		st.success(f"Uploaded and registered file_id={file_id}")
+		st.info("💡 If you granted access to other clients, they can now decrypt this file. Their client apps can import your share (base64) by using the 'Import share' field on their UI.")
+		st.code(_b64e(client_share))
+	except StorageError as exc:
+		st.error(f"MinIO error: {exc}")
+	except Exception:
+		st.error("Upload failed")
+		st.code(traceback.format_exc())
 
-        blob = download_object(st.session_state["object_id"])
 
-        st.write("STEP 4: Decrypting payload")
+st.header("Files")
+colf1, colf2 = st.columns(2)
+with colf1:
+	if st.button("🔄 Refresh Accessible Files"):
+		try:
+			client_id = (st.session_state.get("client_id") or "").strip()
+			if not client_id:
+				raise RuntimeError("Set Client ID first")
+			files = _get_json(f"{authority_base}/files?client_id={client_id}")
+			if not isinstance(files, list):
+				raise RuntimeError("/files returned unexpected response")
+			st.session_state["files"] = files
+		except Exception:
+			st.error("Failed to refresh files")
+			st.code(traceback.format_exc())
+with colf2:
+	st.caption("Shows files where you are authorized")
 
-        envelope = json.loads(blob.decode())
-        kdf_nonce = base64.b64decode(envelope["kdf_nonce_b64"])
-        derived_key = kdf.derive(
-            master_key,
-            context=st.session_state["client_id"].encode() + b"|" + kdf_nonce
-        )
+files = st.session_state.get("files") or []
+options = [f"{f.get('filename')} ({f.get('file_id')})" for f in files]
+if not options:
+	st.info("No accessible files yet. Upload one or refresh.")
+	selected = ""
+else:
+	selected = st.selectbox("Select a file", options=options)
 
-        plaintext = aes.decrypt(envelope["aes"], derived_key)
+if st.button("📂 Request Share + Decrypt"):
+	try:
+		client_id = (st.session_state.get("client_id") or "").strip()
+		client_share = st.session_state.get("client_share")
+		if not client_id or client_share is None:
+			raise RuntimeError("Set Client ID and ensure you have a local client share")
+		if not selected:
+			raise RuntimeError("Select a file first")
 
-        st.success("✅ ACCESS GRANTED")
-        st.code(plaintext.decode())
+		selected_file = None
+		for f in files:
+			if str(f.get("file_id")) in selected:
+				selected_file = f
+				break
+		if not selected_file:
+			raise RuntimeError("Could not resolve selected file")
 
-    except Exception:
-        st.error("⚠️ ERROR (full traceback below)")
-        st.code(traceback.format_exc())
+		blob = download_object(str(selected_file["object_id"]))
+		envelope = json.loads(blob.decode("utf-8"))
+		if not isinstance(envelope, dict):
+			raise RuntimeError("Stored envelope is not a JSON dict")
+
+		resp = _post_json(
+			f"{authority_base}/request_share",
+			{
+				"key_id": str(selected_file["key_id"]),
+				"client_id": client_id,
+				"file_id": str(selected_file["file_id"]),
+				"nonce": str(uuid.uuid4()),
+			},
+			timeout_s=5.0,
+		)
+		st.write("Authority response:", resp)
+		if resp.get("status") != "ok":
+			raise RuntimeError(f"ACCESS DENIED (key_status={resp.get('key_status')}, reason={resp.get('denial_reason')})")
+
+		authority_share = _b64d(str(resp["authority_share_b64"]))
+		master_key = shamir.combine([client_share, authority_share])
+		master_key_buf = bytearray(master_key)
+		derived_key_buf: bytearray | None = None
+		try:
+			kdf_nonce = _b64d(str(envelope["kdf_nonce_b64"]))
+			bound_client_id = str(envelope.get("client_id") or "")
+			derived_key = kdf.derive(master_key, context=bound_client_id.encode("utf-8") + b"|" + kdf_nonce)
+			derived_key_buf = bytearray(derived_key)
+			plaintext = aes.decrypt(envelope["aes"], derived_key)
+		finally:
+			best_effort_wipe(master_key_buf)
+			best_effort_wipe(derived_key_buf)
+
+		st.success("✅ Decrypted")
+		st.code(plaintext.decode("utf-8", errors="replace"))
+	except Exception:
+		st.error("Decrypt failed")
+		st.code(traceback.format_exc())

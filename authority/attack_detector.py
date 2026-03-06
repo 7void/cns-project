@@ -123,9 +123,9 @@ class AttackDetector:
 	) -> AsyncIterator[None]:
 		"""Guard a request; destroys key on violations.
 
-		The request handler should still perform its own authorization checks.
+		Expected-client checks are intentionally skipped to support multi-client
+		vault access controlled at the API layer (per-file ACLs).
 		"""
-		await self._ensure_expected_client_or_violate(key_id=key_id, client_id=client_id)
 		await self._record_nonce_or_violate(key_id=key_id, client_id=client_id, nonce=nonce)
 		await self._enter_inflight_or_violate(key_id=key_id, client_id=client_id)
 		try:

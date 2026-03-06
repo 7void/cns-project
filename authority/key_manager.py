@@ -173,12 +173,14 @@ class KeyManager:
 		if _utcnow() >= record.expires_at:
 			self._terminalize_under_lock(record.key_id, status=KeyStatus.EXPIRED, reason="expired", event_type="key_expired")
 
-	def request_share(self, *, key_id: str, client_id: str) -> Tuple[bool, Optional[bytes], str]:
-		"""Return (allowed, share_bytes, denial_reason)."""
+	def request_share(self, *, key_id: str, client_id: Optional[str] = None) -> Tuple[bool, Optional[bytes], str]:
+		"""Return (allowed, share_bytes, denial_reason).
+
+		Authorization is intentionally NOT enforced here; callers must ensure the
+		requesting client is allowed (e.g., per-file ACLs).
+		"""
 		if not key_id:
 			return False, None, "missing_key_id"
-		if not client_id:
-			return False, None, "missing_client_id"
 
 		with self._lock:
 			record = self._records.get(key_id)
@@ -188,9 +190,6 @@ class KeyManager:
 			self._enforce_expiry_under_lock(record)
 			if record.status in {KeyStatus.DESTROYED, KeyStatus.EXPIRED}:
 				return False, None, "revoked"
-
-			if client_id != record.registered_client_id:
-				return False, None, "client_id_mismatch"
 
 			if record.share is None:
 				# Invariant: ACTIVE keys must hold a share.
