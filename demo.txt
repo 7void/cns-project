@@ -24,7 +24,9 @@ uvicorn authority.main:app --host 127.0.0.1 --port 8000
 streamlit run ui/authority_ui.py
 
 6. start client ui:
+$env:MINIO_ENDPOINT="127.0.0.1:9000"; $env:MINIO_ACCESS_KEY="minioadmin"; $env:MINIO_SECRET_KEY="minioadmin"; streamlit run ui/client_ui.py
 
-streamlit run ui/client_ui.py
+
 
 7. on client ui click create demo session
+

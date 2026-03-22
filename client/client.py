@@ -52,7 +52,42 @@ def _context_for_kdf(*, client_id: str, nonce: bytes) -> bytes:
 @dataclass
 class ClientConfig:
 	authority_base_url: str
+	canary_base_url: str = ""
 	timeout_seconds: float = 5.0
+
+	# If canary_base_url is empty, fall back to CANARY_BASE_URL env var or default.
+	def __post_init__(self) -> None:
+		if not self.canary_base_url:
+			self.canary_base_url = os.getenv("CANARY_BASE_URL", "http://127.0.0.1:8002")
+
+
+def _try_register_canary(
+	*,
+	canary_base_url: str,
+	key_id: str,
+	client_id: str,
+	canary_share: bytes,
+	timeout_seconds: float,
+) -> bool:
+	"""POST Share 3 to the canary service as a honeypot tripwire.
+
+	Returns True if the canary service accepted the share, False on any error.
+	This function never raises — failure is a silent fallback to the old wipe behaviour.
+	"""
+	try:
+		url = f"{canary_base_url.rstrip('/')}/register_canary"
+		payload: dict[str, Any] = {
+			"key_id": key_id,
+			"client_id": client_id,
+			"canary_share_b64": _b64encode(canary_share),
+		}
+		body = _post_json(url=url, payload=payload, timeout_seconds=timeout_seconds)
+		if body.get("status") == "ok":
+			return True
+		return False
+	except Exception:  # noqa: BLE001
+		# Canary service unavailable — silently fall back to discarding Share 3.
+		return False
 
 
 def _post_json(*, url: str, payload: dict[str, Any], timeout_seconds: float) -> dict[str, Any]:
@@ -105,7 +140,14 @@ class TrustedClient:
 		self._client_share = bytes(client_share)
 
 	def provision_key_material(self, *, key_id: str, expires_in_seconds: int) -> None:
-		"""Generate an AES key, split it (t=2,n=3), retain one share, register one with authority."""
+		"""Generate an AES key, split it (t=2,n=3), retain one share, register one with authority.
+
+		Share 1 (client_share)    — kept locally in self._client_share (RAM only).
+		Share 2 (authority_share) — registered with the authority service.
+		Share 3 (canary_share)    — sent to the canary service as a honeypot tripwire.
+		                            If the canary service is unreachable, Share 3 is
+		                            zeroed immediately (original fallback behaviour).
+		"""
 		master_key = aes.generate_key()
 		master_key_buf = bytearray(master_key)
 		try:
@@ -113,10 +155,20 @@ class TrustedClient:
 			# Retain exactly one share locally; store exactly one with authority.
 			client_share = shares[0]
 			authority_share = shares[1]
-			unused_share = shares[2]
+			canary_share = shares[2]  # Share 3 — sent to canary service as honeypot.
 
-			# Best-effort wipe of the third share buffer if made mutable.
-			best_effort_wipe(bytearray(unused_share))
+			# Attempt to register Share 3 with the canary tripwire service.
+			# On failure (service unreachable), fall back to zeroing the share.
+			canary_registered = _try_register_canary(
+				canary_base_url=self._config.canary_base_url,
+				key_id=key_id,
+				client_id=self.client_id,
+				canary_share=canary_share,
+				timeout_seconds=self._config.timeout_seconds,
+			)
+			if not canary_registered:
+				# Canary unavailable — wipe Share 3 (original behaviour).
+				best_effort_wipe(bytearray(canary_share))
 
 			self._client_share = client_share
 			self.register_key(key_id=key_id, authority_share=authority_share, expires_in_seconds=expires_in_seconds)
