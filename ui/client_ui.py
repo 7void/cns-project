@@ -9,6 +9,10 @@ if PROJECT_ROOT not in sys.path:
 
 import streamlit as st
 import requests
+import urllib3
+
+# Suppress InsecureRequestWarning for self-signed HTTPS certs.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import base64
 import json
 from typing import Any
@@ -18,6 +22,7 @@ from crypto.utils import best_effort_wipe, random_bytes
 from storage.minio_adapter import StorageError, download_object, upload_object
 
 DEFAULT_AUTHORITY_URL = os.getenv("AUTHORITY_BASE_URL", "http://127.0.0.1:8000")
+DEFAULT_CANARY_URL = os.getenv("CANARY_BASE_URL", "http://127.0.0.1:8002")
 
 
 def _b64e(data: bytes) -> str:
@@ -52,7 +57,7 @@ def _save_local_client_share(client_id: str, client_share: bytes) -> None:
 
 
 def _post_json(url: str, payload: dict[str, Any], timeout_s: float = 10.0) -> dict[str, Any]:
-    resp = requests.post(url, json=payload, timeout=timeout_s)
+    resp = requests.post(url, json=payload, timeout=timeout_s, verify=False)
     try:
         return resp.json()
     except Exception as exc:
@@ -60,17 +65,46 @@ def _post_json(url: str, payload: dict[str, Any], timeout_s: float = 10.0) -> di
 
 
 def _get_json(url: str, timeout_s: float = 10.0) -> dict[str, Any]:
-    resp = requests.get(url, timeout=timeout_s)
+    resp = requests.get(url, timeout=timeout_s, verify=False)
     try:
         return resp.json()
     except Exception as exc:
         raise RuntimeError(f"Non-JSON response from authority: HTTP {resp.status_code}") from exc
+
+
+def _try_register_canary_ui(
+    *,
+    canary_base_url: str,
+    key_id: str,
+    client_id: str,
+    canary_share: bytes,
+    timeout_s: float = 5.0,
+) -> bool:
+    """POST Share 3 to the canary service. Returns True on success, False on any error.
+
+    Never raises — failure silently falls back to wiping Share 3 (original behaviour).
+    """
+    try:
+        url = f"{canary_base_url.rstrip('/')}/register_canary"
+        payload = {
+            "key_id": key_id,
+            "client_id": client_id,
+            "canary_share_b64": base64.b64encode(canary_share).decode("ascii"),
+        }
+        resp = requests.post(url, json=payload, timeout=timeout_s, verify=False)
+        data = resp.json()
+        return data.get("status") == "ok"
+    except Exception:  # noqa: BLE001
+        # Canary service unreachable — fall back to discarding Share 3.
+        return False
 
 st.set_page_config(page_title="Client Vault", layout="centered")
 st.title("🧑‍💻 Client Vault")
 
 if "authority_url" not in st.session_state:
     st.session_state["authority_url"] = DEFAULT_AUTHORITY_URL
+if "canary_url" not in st.session_state:
+	st.session_state["canary_url"] = DEFAULT_CANARY_URL
 if "client_id" not in st.session_state:
     st.session_state["client_id"] = ""
 if "client_name" not in st.session_state:
@@ -82,9 +116,15 @@ if "files" not in st.session_state:
 if "all_clients" not in st.session_state:
 	st.session_state["all_clients"] = []
 
-authority_url = st.text_input("Authority URL", value=st.session_state["authority_url"])
-st.session_state["authority_url"] = authority_url
+col_endpoint_1, col_endpoint_2 = st.columns(2)
+with col_endpoint_1:
+	authority_url = st.text_input("Authority URL", value=st.session_state["authority_url"])
+	st.session_state["authority_url"] = authority_url
+with col_endpoint_2:
+	canary_url = st.text_input("Canary URL", value=st.session_state["canary_url"])
+	st.session_state["canary_url"] = canary_url
 authority_base = authority_url.rstrip("/")
+canary_base = canary_url.rstrip("/")
 
 if not st.session_state.get("client_id"):
 	st.header("Login")
@@ -187,11 +227,12 @@ if st.button("⬆️ Encrypt + Upload + Register"):
 		master_key = aes.generate_key()
 		master_key_buf = bytearray(master_key)
 		derived_key_buf: bytearray | None = None
+		canary_share: bytes | None = None
 		try:
 			shares = shamir.split(master_key, t=2, n=3)
 			client_share = shares[0]
 			authority_share = shares[1]
-			best_effort_wipe(bytearray(shares[2]))
+			canary_share = shares[2]
 
 			_save_local_client_share(uploader_id, client_share)
 			st.session_state["client_share"] = client_share
@@ -212,9 +253,22 @@ if st.button("⬆️ Encrypt + Upload + Register"):
 			}
 			blob = json.dumps(envelope).encode("utf-8")
 			upload_object(object_id, blob)
+
+			# Register Share 3 with the canary tripwire service.
+			# Falls back to silently discarding Share 3 if canary is unreachable.
+			canary_ok = _try_register_canary_ui(
+				canary_base_url=DEFAULT_CANARY_URL,
+				key_id=key_id,
+				client_id=uploader_id,
+				canary_share=canary_share,
+			)
+			if not canary_ok:
+				st.warning("⚠️ Canary service unreachable — Share 3 discarded (tripwire inactive for this key).")
 		finally:
 			best_effort_wipe(master_key_buf)
 			best_effort_wipe(derived_key_buf)
+			if canary_share is not None:
+				best_effort_wipe(bytearray(canary_share))
 
 		resp = _post_json(
 			f"{authority_base}/register_file",

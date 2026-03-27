@@ -9,8 +9,12 @@ from threading import RLock
 from typing import Any, Optional
 
 import requests
+import urllib3
 from fastapi import FastAPI, Request
 from pydantic import BaseModel, Field
+
+# Suppress InsecureRequestWarning when posting to authority over self-signed HTTPS.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +101,7 @@ def _fire_canary_alert_sync(
     }
     headers = {"X-Canary-Secret": CANARY_SECRET}
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=5.0)
+        resp = requests.post(url, json=payload, headers=headers, timeout=5.0, verify=False)
         logger.info(
             "Canary alert sent for key_id=%s — authority responded HTTP %s",
             key_id,
