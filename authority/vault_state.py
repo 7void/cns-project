@@ -12,11 +12,12 @@ def _utcnow() -> datetime:
 	return datetime.now(timezone.utc)
 
 
-@dataclass(frozen=True)
+@dataclass
 class Client:
 	client_id: str
 	name: str
 	password_hash: str
+	client_pubkey_b64: str
 	registered_at: datetime
 
 
@@ -62,11 +63,13 @@ class VaultState:
 		self._total_access_requests = 0
 		self._denied_requests = 0
 
-	def register_client(self, *, name: str, password: str) -> Client:
+	def register_client(self, *, name: str, password: str, client_pubkey_b64: str) -> Client:
 		if not name:
 			raise ValueError("name is required")
 		if not password:
 			raise ValueError("password is required")
+		if not client_pubkey_b64:
+			raise ValueError("client_pubkey_b64 is required")
 		with self._lock:
 			existing = [c for c in self._clients.values() if c.name == name]
 			if existing:
@@ -74,7 +77,13 @@ class VaultState:
 			import hashlib
 			password_hash = hashlib.sha256(password.encode()).hexdigest()
 			client_id = f"client-{uuid.uuid4()}"
-			client = Client(client_id=client_id, name=name, password_hash=password_hash, registered_at=_utcnow())
+			client = Client(
+				client_id=client_id,
+				name=name,
+				password_hash=password_hash,
+				client_pubkey_b64=client_pubkey_b64,
+				registered_at=_utcnow(),
+			)
 			self._clients[client_id] = client
 			return client
 
@@ -82,15 +91,21 @@ class VaultState:
 		with self._lock:
 			return list(self._clients.values())
 
-	def login(self, *, name: str, password: str) -> Client:
-		if not name or not password:
-			raise ValueError("name and password are required")
+	def login(self, *, name: str, password: str, client_pubkey_b64: str) -> Client:
+		if not name or not password or not client_pubkey_b64:
+			raise ValueError("name, password, and client_pubkey_b64 are required")
 		password_hash = hashlib.sha256(password.encode()).hexdigest()
 		with self._lock:
 			for client in self._clients.values():
 				if client.name == name and client.password_hash == password_hash:
+					if client.client_pubkey_b64 != client_pubkey_b64:
+						raise ValueError("device key mismatch")
 					return client
 			raise ValueError("invalid name or password")
+
+	def get_client(self, client_id: str) -> Optional[Client]:
+		with self._lock:
+			return self._clients.get(client_id)
 
 	def register_file(
 		self,

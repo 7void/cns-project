@@ -5,8 +5,11 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from threading import RLock
 from fastapi import FastAPI, HTTPException, Header, Request
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from pydantic import BaseModel, Field
 
 from .attack_detector import AttackDetector
@@ -35,12 +38,129 @@ _vault = VaultState()
 _CANARY_SECRET: str = os.getenv("CANARY_SECRET", "canary-secret-dev")
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Demo-only endpoints are disabled by default in hardened mode.
+_DEMO_MODE: bool = _env_flag("CNS_DEMO_MODE", default=False)
+_SIGNATURE_MAX_AGE_SECONDS: int = int(os.getenv("CNS_SIGNATURE_MAX_AGE_SECONDS", "120"))
+_SUSPICIOUS_POISON_THRESHOLD: int = int(os.getenv("CNS_SUSPICIOUS_POISON_THRESHOLD", "3"))
+_suspicious_lock: RLock = RLock()
+_suspicious_attempts_by_key: dict[str, int] = {}
+
+
 def _b64e(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
+def _b64d(data_b64: str) -> bytes:
+    return base64.b64decode(data_b64, validate=True)
+
+
 def _context_for_kdf(*, client_id: str, nonce: bytes) -> bytes:
     return client_id.encode("utf-8") + b"|" + bytes(nonce)
+
+
+def _parse_request_ts_utc(request_ts: str) -> datetime:
+    parsed = datetime.fromisoformat(request_ts.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _request_share_message(*, key_id: str, file_id: str, client_id: str, nonce: str, request_ts: str) -> bytes:
+    message = f"{key_id}|{file_id}|{client_id}|{nonce}|{request_ts}"
+    return message.encode("utf-8")
+
+
+def _verify_request_share_signature(
+    *,
+    key_id: str,
+    file_id: str,
+    client_id: str,
+    nonce: str,
+    request_ts: str,
+    signature_b64: str,
+) -> tuple[bool, str]:
+    client = _vault.get_client(client_id)
+    if client is None:
+        return False, "unknown_client"
+
+    try:
+        req_ts = _parse_request_ts_utc(request_ts)
+    except Exception:
+        return False, "invalid_request_ts"
+
+    age = abs((datetime.now(timezone.utc) - req_ts).total_seconds())
+    if age > _SIGNATURE_MAX_AGE_SECONDS:
+        return False, "stale_request_ts"
+
+    try:
+        pubkey_raw = _b64d(client.client_pubkey_b64)
+        signature_raw = _b64d(signature_b64)
+        pubkey = Ed25519PublicKey.from_public_bytes(pubkey_raw)
+        msg = _request_share_message(
+            key_id=key_id,
+            file_id=file_id,
+            client_id=client_id,
+            nonce=nonce,
+            request_ts=request_ts,
+        )
+        pubkey.verify(signature_raw, msg)
+    except (ValueError, InvalidSignature):
+        return False, "invalid_signature"
+    except Exception:
+        return False, "signature_verification_error"
+
+    return True, "ok"
+
+
+def _record_suspicious_attempt(*, key_id: str, client_id: str, reason: str, ip_address: str) -> bool:
+    if not key_id:
+        return False
+    with _suspicious_lock:
+        count = _suspicious_attempts_by_key.get(key_id, 0) + 1
+        _suspicious_attempts_by_key[key_id] = count
+        threshold_hit = count >= _SUSPICIOUS_POISON_THRESHOLD
+
+    _storage.append_audit_event(
+        event_type="suspicious_share_request",
+        key_id=key_id,
+        client_id=client_id,
+        details={
+            "reason": reason,
+            "ip_address": ip_address,
+            "attempt_count": count,
+            "threshold": _SUSPICIOUS_POISON_THRESHOLD,
+        },
+    )
+
+    if not threshold_hit:
+        return False
+
+    poisoned = _key_manager.poison_key(key_id)
+    _storage.append_audit_event(
+        event_type="suspicious_share_request_poison_attempt",
+        key_id=key_id,
+        client_id=client_id,
+        details={
+            "reason": reason,
+            "poisoned": poisoned,
+            "attempt_count": count,
+        },
+    )
+    return poisoned
+
+
+def _clear_suspicious_attempts(key_id: str) -> None:
+    if not key_id:
+        return
+    with _suspicious_lock:
+        _suspicious_attempts_by_key.pop(key_id, None)
 
 
 @app.get("/healthz")
@@ -73,6 +193,9 @@ async def latest_key() -> LatestKeyResponse:
 
     Intended for demo/operator UIs. Returns only identifiers + lifecycle status.
     """
+    if not _DEMO_MODE:
+        raise HTTPException(status_code=404, detail="Not Found")
+
     try:
         events = _storage.list_audit_events()
     except Exception:
@@ -102,8 +225,10 @@ class RegisterKeyResponse(BaseModel):
 class RequestShareRequest(BaseModel):
     key_id: str = Field(..., min_length=1)
     client_id: str = Field(..., min_length=1)
-    file_id: str | None = None
+    file_id: str = Field(..., min_length=1)
     nonce: str = Field(..., min_length=1)
+    request_ts: str = Field(..., min_length=1)
+    signature_b64: str = Field(..., min_length=1)
 
 
 class RequestShareResponse(BaseModel):
@@ -136,6 +261,7 @@ class CreateDemoSessionResponse(BaseModel):
 class RegisterClientRequest(BaseModel):
     name: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
+    client_pubkey_b64: str = Field(..., min_length=1)
 
 
 class RegisterClientResponse(BaseModel):
@@ -147,6 +273,7 @@ class RegisterClientResponse(BaseModel):
 class LoginRequest(BaseModel):
     name: str = Field(..., min_length=1)
     password: str = Field(..., min_length=1)
+    client_pubkey_b64: str = Field(..., min_length=1)
 
 
 class LoginResponse(BaseModel):
@@ -309,7 +436,11 @@ async def create_demo_session() -> CreateDemoSessionResponse:
 @app.post("/register_client", response_model=RegisterClientResponse)
 async def register_client(body: RegisterClientRequest) -> RegisterClientResponse:
     try:
-        client = _vault.register_client(name=body.name, password=body.password)
+        client = _vault.register_client(
+            name=body.name,
+            password=body.password,
+            client_pubkey_b64=body.client_pubkey_b64,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return RegisterClientResponse(client_id=client.client_id, name=client.name, registered_at=client.registered_at.isoformat())
@@ -318,7 +449,11 @@ async def register_client(body: RegisterClientRequest) -> RegisterClientResponse
 @app.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest) -> LoginResponse:
     try:
-        client = _vault.login(name=body.name, password=body.password)
+        client = _vault.login(
+            name=body.name,
+            password=body.password,
+            client_pubkey_b64=body.client_pubkey_b64,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=401, detail=str(exc)) from exc
     return LoginResponse(client_id=client.client_id, name=client.name)
@@ -449,18 +584,41 @@ async def request_share(request: Request, body: RequestShareRequest) -> RequestS
     # checks internally (Fix 4) — the guard here still runs for nonce deduplication,
     # which is fine because attackers will naturally use fresh nonces each request.
     async with _attack_detector.guard_request(key_id=body.key_id, client_id=body.client_id, nonce=body.nonce):
-        file_id = (body.file_id or "").strip()
-        if file_id:
-            record = _vault.get_file(file_id)
-            if record is None:
-                _vault.log_access(client_id=body.client_id, file_id=file_id, result="DENIED", reason="unknown_file")
-                return RequestShareResponse(status="denied", authority_share_b64=None, denial_reason="unknown_file", key_status="UNKNOWN")
-            if record.key_id != body.key_id:
-                _vault.log_access(client_id=body.client_id, file_id=file_id, result="DENIED", reason="key_mismatch")
-                return RequestShareResponse(status="denied", authority_share_b64=None, denial_reason="key_mismatch", key_status=_key_manager.get_key_status(body.key_id))
-            if body.client_id not in record.authorized_clients:
-                _vault.log_access(client_id=body.client_id, file_id=file_id, result="DENIED", reason="not_authorized")
-                return RequestShareResponse(status="denied", authority_share_b64=None, denial_reason="not_authorized", key_status=_key_manager.get_key_status(body.key_id))
+        def _deny(denial_reason: str, key_status: str | None = None, suspicious: bool = False) -> RequestShareResponse:
+            _vault.log_access(client_id=body.client_id, file_id=file_id, result="DENIED", reason=denial_reason)
+            if suspicious:
+                _record_suspicious_attempt(
+                    key_id=body.key_id,
+                    client_id=body.client_id,
+                    reason=denial_reason,
+                    ip_address=requester_ip,
+                )
+            return RequestShareResponse(
+                status="denied",
+                authority_share_b64=None,
+                denial_reason=denial_reason,
+                key_status=key_status or _key_manager.get_key_status(body.key_id),
+            )
+
+        file_id = body.file_id.strip()
+        record = _vault.get_file(file_id)
+        if record is None:
+            return _deny("unknown_file", key_status="UNKNOWN", suspicious=True)
+        if record.key_id != body.key_id:
+            return _deny("key_mismatch", suspicious=True)
+        if body.client_id not in record.authorized_clients:
+            return _deny("not_authorized", suspicious=True)
+
+        sig_ok, sig_reason = _verify_request_share_signature(
+            key_id=body.key_id,
+            file_id=file_id,
+            client_id=body.client_id,
+            nonce=body.nonce,
+            request_ts=body.request_ts,
+            signature_b64=body.signature_b64,
+        )
+        if not sig_ok:
+            return _deny(sig_reason, suspicious=True)
 
         allowed, share, denial = _key_manager.request_share(
             key_id=body.key_id,
@@ -469,19 +627,16 @@ async def request_share(request: Request, body: RequestShareRequest) -> RequestS
             nonce=body.nonce,
         )
         key_status = _key_manager.get_key_status(body.key_id)
-        if file_id:
-            # Keep file status aligned with key lifecycle for dashboards.
-            if key_status in {"DESTROYED", "EXPIRED"}:
-                _vault.set_file_status_by_key_id(key_id=body.key_id, status=key_status)
+        # Keep file status aligned with key lifecycle for dashboards.
+        if key_status in {"DESTROYED", "EXPIRED"}:
+            _vault.set_file_status_by_key_id(key_id=body.key_id, status=key_status)
 
         if not allowed or share is None:
             denial_reason = "revoked" if key_status in {"DESTROYED", "EXPIRED"} else denial
-            if file_id:
-                _vault.log_access(client_id=body.client_id, file_id=file_id, result="DENIED", reason=denial_reason)
-            return RequestShareResponse(status="denied", authority_share_b64=None, denial_reason=denial_reason, key_status=key_status)
+            return _deny(denial_reason, key_status=key_status, suspicious=False)
 
-        if file_id:
-            _vault.log_access(client_id=body.client_id, file_id=file_id, result="SUCCESS", reason="ok")
+        _clear_suspicious_attempts(body.key_id)
+        _vault.log_access(client_id=body.client_id, file_id=file_id, result="SUCCESS", reason="ok")
         return RequestShareResponse(status="ok", authority_share_b64=_key_manager.encode_share_b64(share), denial_reason=None, key_status=key_status)
 
 
