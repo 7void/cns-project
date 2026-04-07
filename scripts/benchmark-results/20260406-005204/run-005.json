@@ -1,0 +1,152 @@
+﻿{
+    "run":  5,
+    "timestamp":  "2026-04-06T00:52:06.5212628+05:30",
+    "target":  {
+                   "uploader_client_id":  "client-24a6be9f-c7b6-4444-bc2e-2f1455f12b85",
+                   "file_id":  "file-b6a52825-f528-4335-8855-f81869278dcf",
+                   "authorized_clients":  [
+                                              "client-24a6be9f-c7b6-4444-bc2e-2f1455f12b85",
+                                              "client-75f10176-9d0a-4831-ace6-bac084eb4b1e"
+                                          ],
+                   "key_id":  "key-72717654-2e8e-4f1c-9616-61b35271b280"
+               },
+    "scenarios":  [
+                      {
+                          "scenario":  "invalid_signature_threshold",
+                          "attempts":  [
+                                           {
+                                               "attempt":  1,
+                                               "ok":  true,
+                                               "error":  null,
+                                               "duration_ms":  4.5,
+                                               "response":  {
+                                                                "status":  "denied",
+                                                                "authority_share_b64":  null,
+                                                                "denial_reason":  "invalid_signature",
+                                                                "key_status":  "POISONED"
+                                                            }
+                                           },
+                                           {
+                                               "attempt":  2,
+                                               "ok":  true,
+                                               "error":  null,
+                                               "duration_ms":  3.3,
+                                               "response":  {
+                                                                "status":  "denied",
+                                                                "authority_share_b64":  null,
+                                                                "denial_reason":  "invalid_signature",
+                                                                "key_status":  "POISONED"
+                                                            }
+                                           },
+                                           {
+                                               "attempt":  3,
+                                               "ok":  true,
+                                               "error":  null,
+                                               "duration_ms":  2.15,
+                                               "response":  {
+                                                                "status":  "denied",
+                                                                "authority_share_b64":  null,
+                                                                "denial_reason":  "invalid_signature",
+                                                                "key_status":  "POISONED"
+                                                            }
+                                           }
+                                       ],
+                          "poisoned_at_attempt":  1
+                      },
+                      {
+                          "scenario":  "canary_then_probe",
+                          "probe":  {
+                                        "ok":  true,
+                                        "error":  null,
+                                        "duration_ms":  1.95,
+                                        "response":  {
+                                                         "status":  "denied",
+                                                         "authority_share_b64":  null,
+                                                         "denial_reason":  "invalid_signature",
+                                                         "key_status":  "POISONED"
+                                                     }
+                                    },
+                          "canary":  {
+                                         "ok":  true,
+                                         "error":  null,
+                                         "duration_ms":  3.72,
+                                         "response":  {
+                                                          "status":  "ok",
+                                                          "canary_share_b64":  "AyCAumealoVCQKVY4aEMn+Mt9Drb88aU+M47/inEMQvP"
+                                                      }
+                                     }
+                      },
+                      {
+                          "scenario":  "key_mismatch",
+                          "result":  {
+                                         "ok":  true,
+                                         "error":  null,
+                                         "duration_ms":  1.4,
+                                         "response":  {
+                                                          "status":  "denied",
+                                                          "authority_share_b64":  null,
+                                                          "denial_reason":  "key_mismatch",
+                                                          "key_status":  "UNKNOWN"
+                                                      }
+                                     },
+                          "wrong_key_id":  "key-wrong-a7470f17-6d58-4db1-a951-3ad8ef2dc98c"
+                      },
+                      {
+                          "scenario":  "not_authorized",
+                          "result":  {
+                                         "ok":  true,
+                                         "error":  null,
+                                         "duration_ms":  2.04,
+                                         "response":  {
+                                                          "status":  "denied",
+                                                          "authority_share_b64":  null,
+                                                          "denial_reason":  "not_authorized",
+                                                          "key_status":  "POISONED"
+                                                      }
+                                     },
+                          "unauth_client_id":  "client-unauth-e7df7422-db1e-4bfc-bb60-e77b9a6fffbc"
+                      },
+                      {
+                          "scenario":  "stale_timestamp_threshold",
+                          "attempts":  [
+                                           {
+                                               "attempt":  1,
+                                               "ok":  true,
+                                               "error":  null,
+                                               "duration_ms":  2.62,
+                                               "response":  {
+                                                                "status":  "denied",
+                                                                "authority_share_b64":  null,
+                                                                "denial_reason":  "stale_request_ts",
+                                                                "key_status":  "POISONED"
+                                                            }
+                                           },
+                                           {
+                                               "attempt":  2,
+                                               "ok":  true,
+                                               "error":  null,
+                                               "duration_ms":  2.77,
+                                               "response":  {
+                                                                "status":  "denied",
+                                                                "authority_share_b64":  null,
+                                                                "denial_reason":  "stale_request_ts",
+                                                                "key_status":  "POISONED"
+                                                            }
+                                           },
+                                           {
+                                               "attempt":  3,
+                                               "ok":  true,
+                                               "error":  null,
+                                               "duration_ms":  2.79,
+                                               "response":  {
+                                                                "status":  "denied",
+                                                                "authority_share_b64":  null,
+                                                                "denial_reason":  "stale_request_ts",
+                                                                "key_status":  "POISONED"
+                                                            }
+                                           }
+                                       ],
+                          "poisoned_at_attempt":  1
+                      }
+                  ]
+}

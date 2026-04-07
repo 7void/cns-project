@@ -1,0 +1,6 @@
+scenario,events,avg_latency_ms,p50_latency_ms,p95_latency_ms,poisoned_event_count,poisoned_event_rate,denial_reason_counts
+invalid_signature_threshold,90,4.7,2.765,8.871,90,1.0,"{""invalid_signature"": 90}"
+canary_then_probe,60,5.306,3.18,12.244,30,0.5,"{""invalid_signature"": 30}"
+key_mismatch,30,1.996,1.825,3.432,0,0.0,"{""key_mismatch"": 30}"
+not_authorized,30,2.379,2.06,3.553,30,1.0,"{""not_authorized"": 30}"
+stale_timestamp_threshold,90,2.723,2.625,4.369,90,1.0,"{""stale_request_ts"": 90}"

@@ -24,7 +24,7 @@ from crypto.utils import best_effort_wipe, random_bytes
 from storage.minio_adapter import StorageError, download_object, upload_object
 
 DEFAULT_AUTHORITY_URL = os.getenv("AUTHORITY_BASE_URL", "http://127.0.0.1:8000")
-DEFAULT_CANARY_URL = os.getenv("CANARY_BASE_URL", "http://127.0.0.1:8001")
+DEFAULT_CANARY_URL = os.getenv("CANARY_BASE_URL", "http://127.0.0.1:8002")
 SHARE_WRAP_PBKDF2_ITERATIONS = 600_000
 
 
@@ -185,7 +185,7 @@ def _get_json(url: str, timeout_s: float = 10.0) -> dict[str, Any]:
         raise RuntimeError(f"Non-JSON response from authority: HTTP {resp.status_code}") from exc
 
 st.set_page_config(page_title="Client Vault", layout="centered")
-st.title("Ã°Å¸Â§â€˜Ã¢â‚¬ÂÃ°Å¸â€™Â» Client Vault")
+st.title("Client Vault")
 
 if "authority_url" not in st.session_state:
     st.session_state["authority_url"] = DEFAULT_AUTHORITY_URL
@@ -222,7 +222,7 @@ if not st.session_state.get("client_id"):
 	with col1:
 		name = st.text_input("Username", placeholder="e.g. Alice")
 		password = st.text_input("Password", type="password", placeholder="your password")
-		if st.button("Ã°Å¸â€Â Login"):
+		if st.button("Login"):
 			try:
 				signing_private_key = _load_or_create_signing_key(name)
 				resp = _post_json(
@@ -256,7 +256,7 @@ if not st.session_state.get("client_id"):
 		st.subheader("New user?")
 		new_name = st.text_input("Username", placeholder="e.g. Bob", key="reg_name")
 		new_password = st.text_input("Password", type="password", placeholder="your password", key="reg_pass")
-		if st.button("Ã¢Å“â€¦ Register"):
+		if st.button("Register"):
 			try:
 				signing_private_key = _load_or_create_signing_key(new_name)
 				resp = _post_json(
@@ -282,7 +282,7 @@ if not st.session_state.get("client_id"):
 	st.stop()
 
 st.header(f"Welcome, {st.session_state['client_name']}")
-if st.button("Ã°Å¸Å¡Âª Logout"):
+if st.button("Logout"):
 	st.session_state["client_id"] = ""
 	st.session_state["client_name"] = ""
 	st.session_state["client_share"] = None
@@ -293,7 +293,7 @@ if st.button("Ã°Å¸Å¡Âª Logout"):
 
 st.header("Client Share")
 import_share_b64 = st.text_input("Import share (base64)", value="", placeholder="Paste client share b64 from collaborator")
-if st.button("Ã°Å¸â€™Â¾ Save Imported Share"):
+if st.button("Save Imported Share"):
 	try:
 		wrap_password = str(st.session_state.get("share_wrap_password") or "")
 		if not wrap_password:
@@ -307,7 +307,7 @@ if st.button("Ã°Å¸â€™Â¾ Save Imported Share"):
 		st.code(traceback.format_exc())
 
 st.header("Upload File")
-if st.button("Ã°Å¸â€â€ž Refresh Available Clients"):
+if st.button("Refresh Available Clients"):
 	try:
 		all_clients = _get_json(f"{authority_base}/clients")
 		if not isinstance(all_clients, list):
@@ -329,7 +329,7 @@ selected_clients = st.multiselect(
 	format_func=lambda c: f"{c['name']} ({c['client_id']})",
 )
 
-if st.button("Ã¢Â¬â€ Ã¯Â¸Â Encrypt + Upload + Register"):
+if st.button("Encrypt + Upload + Register"):
 	try:
 		if uploaded is None:
 			raise RuntimeError("Choose a file first")
@@ -408,7 +408,7 @@ if st.button("Ã¢Â¬â€ Ã¯Â¸Â Encrypt + Upload + Register"):
 			raise RuntimeError(f"register_file failed: {resp}")
 
 		st.success(f"Uploaded and registered file_id={file_id}")
-		st.info("Ã°Å¸â€™Â¡ If you granted access to other clients, they can now decrypt this file. Their client apps can import your share (base64) by using the 'Import share' field on their UI.")
+		st.info("If you granted access to other clients, they can now decrypt this file. Their client apps can import your share (base64) by using the 'Import share' field on their UI.")
 		st.code(_b64e(client_share))
 	except StorageError as exc:
 		st.error(f"MinIO error: {exc}")
@@ -420,7 +420,7 @@ if st.button("Ã¢Â¬â€ Ã¯Â¸Â Encrypt + Upload + Register"):
 st.header("Files")
 colf1, colf2 = st.columns(2)
 with colf1:
-	if st.button("Ã°Å¸â€â€ž Refresh Accessible Files"):
+	if st.button("Refresh Accessible Files"):
 		try:
 			client_id = (st.session_state.get("client_id") or "").strip()
 			if not client_id:
@@ -443,7 +443,7 @@ if not options:
 else:
 	selected = st.selectbox("Select a file", options=options)
 
-if st.button("Ã°Å¸â€œâ€š Request Share + Decrypt"):
+if st.button("Request Share + Decrypt"):
 	try:
 		client_id = (st.session_state.get("client_id") or "").strip()
 		client_share = st.session_state.get("client_share")
@@ -507,7 +507,7 @@ if st.button("Ã°Å¸â€œâ€š Request Share + Decrypt"):
 			best_effort_wipe(master_key_buf)
 			best_effort_wipe(derived_key_buf)
 
-		st.success("Ã¢Å“â€¦ Decrypted")
+		st.success("Decrypted")
 		st.code(plaintext.decode("utf-8", errors="replace"))
 	except Exception:
 		st.error("Decrypt failed")

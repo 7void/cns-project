@@ -1,0 +1,62 @@
+{
+  "total_events": 300,
+  "scenario_summary": {
+    "invalid_signature_threshold": {
+      "events": 90,
+      "avg_latency_ms": 4.7,
+      "p50_latency_ms": 2.765,
+      "p95_latency_ms": 8.871,
+      "poisoned_event_count": 90,
+      "poisoned_event_rate": 1.0,
+      "denial_reason_counts": {
+        "invalid_signature": 90
+      }
+    },
+    "canary_then_probe": {
+      "events": 60,
+      "avg_latency_ms": 5.306,
+      "p50_latency_ms": 3.18,
+      "p95_latency_ms": 12.244,
+      "poisoned_event_count": 30,
+      "poisoned_event_rate": 0.5,
+      "denial_reason_counts": {
+        "invalid_signature": 30
+      }
+    },
+    "key_mismatch": {
+      "events": 30,
+      "avg_latency_ms": 1.996,
+      "p50_latency_ms": 1.825,
+      "p95_latency_ms": 3.432,
+      "poisoned_event_count": 0,
+      "poisoned_event_rate": 0.0,
+      "denial_reason_counts": {
+        "key_mismatch": 30
+      }
+    },
+    "not_authorized": {
+      "events": 30,
+      "avg_latency_ms": 2.379,
+      "p50_latency_ms": 2.06,
+      "p95_latency_ms": 3.553,
+      "poisoned_event_count": 30,
+      "poisoned_event_rate": 1.0,
+      "denial_reason_counts": {
+        "not_authorized": 30
+      }
+    },
+    "stale_timestamp_threshold": {
+      "events": 90,
+      "avg_latency_ms": 2.723,
+      "p50_latency_ms": 2.625,
+      "p95_latency_ms": 4.369,
+      "poisoned_event_count": 90,
+      "poisoned_event_rate": 1.0,
+      "denial_reason_counts": {
+        "stale_request_ts": 90
+      }
+    }
+  },
+  "input_dir": "C:\\Users\\ahana\\Documents\\cns-project\\scripts\\benchmark-results\\20260406-005204",
+  "run_files": 30
+}

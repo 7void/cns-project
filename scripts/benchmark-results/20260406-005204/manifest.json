@@ -1,0 +1,16 @@
+﻿{
+    "threshold_attempts":  3,
+    "canary_base_url":  "http://127.0.0.1:8002",
+    "runs":  30,
+    "scenarios":  [
+                      "invalid_signature_threshold",
+                      "canary_then_probe",
+                      "key_mismatch",
+                      "not_authorized",
+                      "stale_timestamp_threshold"
+                  ],
+    "authority_base_url":  "http://127.0.0.1:8000",
+    "generated_at":  "2026-04-06T00:52:18.3639121+05:30",
+    "output_dir":  "C:\\Users\\ahana\\Documents\\cns-project\\scripts\\benchmark-results\\20260406-005204",
+    "files_found":  1
+}
